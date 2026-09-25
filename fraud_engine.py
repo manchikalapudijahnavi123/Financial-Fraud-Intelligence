@@ -1,0 +1,646 @@
+"""
+FraudShield AI - Fraud Intelligence Engine
+Educational prototype using synthetic data.
+
+This module contains the fraud-detection logic only.
+FastAPI/API code belongs in main.py.
+"""
+
+from collections import deque, defaultdict
+import heapq
+import math
+import random
+from datetime import datetime, timedelta
+
+import numpy as np
+import pandas as pd
+
+
+RANDOM_SEED = 42
+random.seed(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
+
+HIGH_RISK = 70
+MEDIUM_RISK = 40
+RAPID_WINDOW_MINUTES = 10
+RAPID_TRANSACTION_LIMIT = 3
+LARGE_AMOUNT = 50000
+
+
+class SyntheticTransactionGenerator:
+    MERCHANTS = [
+        "Amazon", "Flipkart", "Swiggy", "Uber", "Myntra",
+        "IRCTC", "BookMyShow", "Apple", "Google", "RetailStore"
+    ]
+
+    LOCATIONS = [
+        "Hyderabad", "Vijayawada","Guntur", "Bengaluru", "Chennai",
+        "Mumbai", "Delhi", "Pune", "Kolkata"
+    ]
+
+    TRANSACTION_TYPES = ["UPI", "CARD", "NETBANKING", "ATM"]
+
+    def __init__(self, n=300):
+        self.n = n
+        self.accounts = [f"ACC{1000+i}" for i in range(25)]
+        self.devices = {
+            account: f"DEV{2000+i}"
+            for i, account in enumerate(self.accounts)
+        }
+
+    def generate(self):
+        start = datetime(2026, 9, 1, 8, 0, 0)
+        rows = []
+
+        for i in range(self.n):
+            account = random.choice(self.accounts)
+            location = random.choice(["Hyderabad", "Vijayawada", "Bengaluru"])
+            amount = round(
+                max(100, np.random.lognormal(mean=7.0, sigma=0.65)), 2
+            )
+            timestamp = start + timedelta(
+                minutes=random.randint(0, 60 * 24 * 7)
+            )
+
+            rows.append({
+                "transaction_id": f"TX{i+1:05d}",
+                "account_id": account,
+                "receiver_id": f"MER{random.randint(1, 15):03d}",
+                "amount": amount,
+                "timestamp": timestamp,
+                "location": location,
+                "device_id": self.devices[account],
+                "merchant": random.choice(self.MERCHANTS),
+                "transaction_type": random.choice(self.TRANSACTION_TYPES)
+            })
+
+        df = pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
+
+        fraud_count = max(12, self.n // 12)
+        fraud_indices = random.sample(range(self.n), fraud_count)
+
+        suspicious_devices = {}
+        suspicious_locations = ["Mumbai", "Delhi", "Pune"]
+
+        for idx in fraud_indices:
+            account = df.loc[idx, "account_id"]
+
+            df.loc[idx, "amount"] = round(
+                random.uniform(60000, 180000), 2
+            )
+            df.loc[idx, "location"] = random.choice(suspicious_locations)
+
+            new_device = suspicious_devices.setdefault(
+                account, f"NEWDEV{random.randint(9000, 9999)}"
+            )
+            df.loc[idx, "device_id"] = new_device
+
+            original_time = df.loc[idx, "timestamp"]
+            df.loc[idx, "timestamp"] = original_time.replace(
+                hour=random.choice([0, 1, 2, 3]),
+                minute=random.randint(0, 59)
+            )
+
+            df.loc[idx, "receiver_id"] = "SUSPECT_MERCHANT"
+
+        return df.sort_values("timestamp").reset_index(drop=True)
+
+
+class TransactionQueue:
+    def __init__(self):
+        self.queue = deque()
+
+    def enqueue(self, transaction):
+        self.queue.append(transaction)
+
+    def dequeue(self):
+        return self.queue.popleft() if self.queue else None
+
+    def __len__(self):
+        return len(self.queue)
+
+
+class RecentTransactionDeque:
+    def __init__(self):
+        self.data = deque()
+
+    def add(self, transaction):
+        self.data.append(transaction)
+
+    def remove_old(self, cutoff):
+        while self.data and self.data[0]["timestamp"] < cutoff:
+            self.data.popleft()
+
+    def get_all(self):
+        return list(self.data)
+
+
+class TransactionHashTable:
+    def __init__(self):
+        self.table = {}
+
+    def insert(self, transaction):
+        self.table[transaction["transaction_id"]] = transaction
+
+    def get(self, transaction_id):
+        return self.table.get(transaction_id)
+
+    def __len__(self):
+        return len(self.table)
+
+
+class BehaviorEngine:
+    def __init__(self):
+        self.amount_history = defaultdict(list)
+        self.locations = defaultdict(set)
+        self.devices = defaultdict(set)
+        self.merchants = defaultdict(set)
+
+    def update(self, transaction):
+        account = transaction["account_id"]
+        self.amount_history[account].append(transaction["amount"])
+        self.locations[account].add(transaction["location"])
+        self.devices[account].add(transaction["device_id"])
+        self.merchants[account].add(transaction["merchant"])
+
+    def average_amount(self, account):
+        values = self.amount_history.get(account, [])
+        return float(np.mean(values)) if values else 0.0
+
+    def amount_std(self, account):
+        values = self.amount_history.get(account, [])
+        if len(values) < 2:
+            return 0.0
+        return float(np.std(values))
+
+    def is_new_device(self, transaction):
+        return transaction["device_id"] not in self.devices[transaction["account_id"]]
+
+    def is_new_location(self, transaction):
+        return transaction["location"] not in self.locations[transaction["account_id"]]
+
+    def is_new_merchant(self, transaction):
+        return transaction["merchant"] not in self.merchants[transaction["account_id"]]
+
+
+class FeatureEngine:
+    def __init__(self, behavior_engine):
+        self.behavior = behavior_engine
+
+    def build_features(self, transaction, recent_transactions, account_connections):
+        account = transaction["account_id"]
+        amount = transaction["amount"]
+
+        avg = self.behavior.average_amount(account)
+        std = self.behavior.amount_std(account)
+
+        if avg <= 0:
+            avg = 5000.0
+
+        if std <= 1:
+            std = max(avg * 0.5, 1000.0)
+
+        amount_ratio = amount / avg
+        z_score = abs(amount - avg) / std
+
+        hour = transaction["timestamp"].hour
+        night = int(hour < 6 or hour >= 23)
+
+        window_start = transaction["timestamp"] - timedelta(
+            minutes=RAPID_WINDOW_MINUTES
+        )
+
+        rapid_count = sum(
+            1
+            for t in recent_transactions
+            if t["account_id"] == account
+            and window_start <= t["timestamp"] <= transaction["timestamp"]
+        )
+
+        return {
+            "amount_ratio": min(amount_ratio, 20.0),
+            "z_score": min(z_score, 20.0),
+            "night_transaction": night,
+            "new_device": int(self.behavior.is_new_device(transaction)),
+            "new_location": int(self.behavior.is_new_location(transaction)),
+            "new_merchant": int(self.behavior.is_new_merchant(transaction)),
+            "rapid_count": min(rapid_count, 10),
+            "graph_connections": min(account_connections, 20),
+        }
+
+
+class RuleEngine:
+    def evaluate(self, transaction, features):
+        score = 0
+        reasons = []
+
+        if transaction["amount"] >= LARGE_AMOUNT:
+            score += 20
+            reasons.append("Very large transaction amount")
+
+        if features["amount_ratio"] >= 5:
+            score += 15
+            reasons.append("Amount is much higher than the account's usual amount")
+
+        if features["z_score"] >= 3:
+            score += 15
+            reasons.append("Transaction is a strong behavioral anomaly")
+
+        if features["new_device"]:
+            score += 15
+            reasons.append("Transaction uses a new device")
+
+        if features["new_location"]:
+            score += 10
+            reasons.append("Transaction occurs from a new location")
+
+        if features["new_merchant"]:
+            score += 5
+            reasons.append("New merchant for this account")
+
+        if features["night_transaction"]:
+            score += 8
+            reasons.append("Transaction occurred during unusual hours")
+
+        if features["rapid_count"] >= RAPID_TRANSACTION_LIMIT:
+            score += 15
+            reasons.append("Multiple transactions detected in a short time window")
+
+        if features["graph_connections"] >= 4:
+            score += 10
+            reasons.append("Account has many graph connections")
+
+        return min(score, 100), reasons
+
+
+class AnomalyDetector:
+    def detect(self, features):
+        return features["z_score"] >= 3.0
+
+
+class OnlineLogisticRegression:
+    FEATURE_NAMES = [
+        "amount_ratio", "z_score", "night_transaction", "new_device",
+        "new_location", "new_merchant", "rapid_count", "graph_connections"
+    ]
+
+    def __init__(self, learning_rate=0.03):
+        self.learning_rate = learning_rate
+        self.weights = np.zeros(len(self.FEATURE_NAMES), dtype=float)
+        self.bias = 0.0
+
+    @staticmethod
+    def sigmoid(x):
+        x = max(min(float(x), 30), -30)
+        return 1.0 / (1.0 + math.exp(-x))
+
+    def vectorize(self, features):
+        return np.array(
+            [features[name] for name in self.FEATURE_NAMES],
+            dtype=float
+        )
+
+    def predict_probability(self, features):
+        x = self.vectorize(features)
+        return self.sigmoid(np.dot(self.weights, x) + self.bias)
+
+    def update(self, features, label):
+        x = self.vectorize(features)
+        probability = self.predict_probability(features)
+        error = probability - label
+        self.weights -= self.learning_rate * error * x
+        self.bias -= self.learning_rate * error
+
+
+class FraudGraph:
+    def __init__(self):
+        self.adjacency = defaultdict(set)
+
+    def add_edge(self, a, b):
+        self.adjacency[a].add(b)
+        self.adjacency[b].add(a)
+
+    def degree(self, node):
+        return len(self.adjacency[node])
+
+    def bfs(self, start, max_nodes=20):
+        if start not in self.adjacency:
+            return []
+
+        visited = {start}
+        queue = deque([start])
+        result = []
+
+        while queue and len(result) < max_nodes:
+            node = queue.popleft()
+            result.append(node)
+
+            for neighbor in sorted(self.adjacency[node]):
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    queue.append(neighbor)
+
+        return result
+
+    def dfs(self, start, max_nodes=20):
+        if start not in self.adjacency:
+            return []
+
+        visited = set()
+        stack = [start]
+        result = []
+
+        while stack and len(result) < max_nodes:
+            node = stack.pop()
+
+            if node in visited:
+                continue
+
+            visited.add(node)
+            result.append(node)
+
+            for neighbor in sorted(self.adjacency[node], reverse=True):
+                if neighbor not in visited:
+                    stack.append(neighbor)
+
+        return result
+
+    def has_cycle(self):
+        visited = set()
+
+        def dfs(node, parent):
+            visited.add(node)
+
+            for neighbor in self.adjacency[node]:
+                if neighbor not in visited:
+                    if dfs(neighbor, node):
+                        return True
+                elif neighbor != parent:
+                    return True
+
+            return False
+
+        for node in self.adjacency:
+            if node not in visited:
+                if dfs(node, None):
+                    return True
+
+        return False
+
+
+class RiskPriorityQueue:
+    def __init__(self):
+        self.heap = []
+        self.counter = 0
+
+    def push(self, transaction_id, risk_score):
+        self.counter += 1
+        heapq.heappush(
+            self.heap,
+            (-risk_score, self.counter, transaction_id)
+        )
+
+    def top(self, n=10):
+        ordered = sorted(self.heap)
+        return [(item[2], -item[0]) for item in ordered[:n]]
+
+
+def classify_risk(score):
+    if score >= 80:
+        return "CRITICAL"
+    if score >= HIGH_RISK:
+        return "HIGH"
+    if score >= MEDIUM_RISK:
+        return "MEDIUM"
+    return "LOW"
+
+
+def calculate_risk_score(rule_score, ml_probability, anomaly, graph_flag):
+    rule_component = rule_score * 0.45
+    ml_component = ml_probability * 100 * 0.35
+
+    intelligence_component = 0
+    if anomaly:
+        intelligence_component += 12
+    if graph_flag:
+        intelligence_component += 8
+
+    intelligence_component = min(intelligence_component, 20)
+
+    return min(
+        round(
+            rule_component +
+            ml_component +
+            intelligence_component,
+            2
+        ),
+        100
+    )
+
+
+class FraudIntelligenceEngine:
+    """
+    Main fraud engine.
+
+    The constructor can warm up the account behavior and graph using
+    synthetic historical data. New API transactions can then be
+    analyzed without running the dashboard or demo code.
+    """
+
+    def __init__(self, warmup_transactions=300):
+        self.transaction_queue = TransactionQueue()
+        self.transaction_table = TransactionHashTable()
+        self.recent_transactions = RecentTransactionDeque()
+        self.behavior = BehaviorEngine()
+        self.feature_engine = FeatureEngine(self.behavior)
+        self.rule_engine = RuleEngine()
+        self.anomaly_detector = AnomalyDetector()
+        self.ml_model = OnlineLogisticRegression()
+        self.graph = FraudGraph()
+        self.priority_queue = RiskPriorityQueue()
+        self.results = []
+
+        self._warmup(warmup_transactions)
+
+    def _warmup(self, n):
+        generator = SyntheticTransactionGenerator(n=n)
+        df = generator.generate()
+
+        # Establish relationships first.
+        self.build_graph(df)
+
+        # Build account behavior and train the educational online model.
+        for _, row in df.iterrows():
+            self.process_transaction(row.to_dict(), store_result=False)
+
+        # Keep demo history but clear API-facing result list.
+        self.results = []
+
+    def build_graph(self, df):
+        for _, row in df.iterrows():
+            self.graph.add_edge(row["account_id"], row["device_id"])
+            self.graph.add_edge(row["account_id"], row["receiver_id"])
+
+    def account_is_graph_suspicious(self, account):
+        for neighbor in self.graph.adjacency[account]:
+            if self.graph.degree(neighbor) >= 4:
+                return True
+        return False
+
+    def process_transaction(self, transaction, store_result=True):
+        # Ensure timestamp is a datetime.
+        if isinstance(transaction["timestamp"], str):
+            transaction["timestamp"] = datetime.fromisoformat(
+                transaction["timestamp"].replace("Z", "+00:00")
+            ).replace(tzinfo=None)
+
+        self.transaction_queue.enqueue(transaction)
+        self.transaction_table.insert(transaction)
+
+        account = transaction["account_id"]
+        history = self.recent_transactions.get_all()
+        account_connections = self.graph.degree(account)
+
+        features = self.feature_engine.build_features(
+            transaction,
+            history,
+            account_connections
+        )
+
+        rule_score, reasons = self.rule_engine.evaluate(
+            transaction,
+            features
+        )
+
+        anomaly = self.anomaly_detector.detect(features)
+
+        if anomaly and "Behavioral anomaly detected" not in reasons:
+            reasons.append("Behavioral anomaly detected")
+
+        ml_probability = self.ml_model.predict_probability(features)
+
+        graph_flag = self.account_is_graph_suspicious(account)
+
+        if graph_flag:
+            reasons.append(
+                "Account is connected to a highly shared graph node"
+            )
+
+        risk_score = calculate_risk_score(
+            rule_score,
+            ml_probability,
+            anomaly,
+            graph_flag
+        )
+
+        risk_level = classify_risk(risk_score)
+
+        synthetic_label = int(
+            rule_score >= 50
+            or anomaly
+            or graph_flag
+            or ml_probability >= 0.75
+        )
+
+        self.ml_model.update(features, synthetic_label)
+
+        result = {
+            "transaction_id": transaction["transaction_id"],
+            "account_id": account,
+            "amount": float(transaction["amount"]),
+            "location": transaction["location"],
+            "device_id": transaction["device_id"],
+            "merchant": transaction["merchant"],
+            "transaction_type": transaction["transaction_type"],
+            "timestamp": transaction["timestamp"].isoformat(),
+            "risk_score": risk_score,
+            "risk_level": risk_level,
+            "rule_score": rule_score,
+            "ml_probability": round(ml_probability * 100, 2),
+            "anomaly": bool(anomaly),
+            "graph_flag": bool(graph_flag),
+            "reasons": reasons if reasons else ["No major suspicious signals"],
+            "feature_amount_ratio": round(features["amount_ratio"], 2),
+            "feature_z_score": round(features["z_score"], 2),
+            "rapid_count": int(features["rapid_count"]),
+        }
+
+        if store_result:
+            self.results.append(result)
+            self.priority_queue.push(
+                result["transaction_id"],
+                result["risk_score"]
+            )
+
+        # Update state after analysis.
+        self.behavior.update(transaction)
+        self.recent_transactions.add(transaction)
+
+        cutoff = transaction["timestamp"] - timedelta(
+            minutes=RAPID_WINDOW_MINUTES
+        )
+        self.recent_transactions.remove_old(cutoff)
+
+        # Add the new relationships after analyzing the transaction.
+        self.graph.add_edge(account, transaction["device_id"])
+        self.graph.add_edge(account, transaction["receiver_id"])
+
+        return result
+
+    def analyze_api_transaction(self, data):
+        """
+        Adapter for the FastAPI request.
+
+        The frontend can send a compact transaction object.
+        Boolean flags are translated into realistic transaction fields.
+        """
+
+        now = datetime.now().replace(microsecond=0)
+
+        account_id = data.get("account_id") or "ACC1000"
+
+        location = data.get("location")
+        if not location:
+            location = "Mumbai" if data.get("location_changed") else "Hyderabad"
+
+        device_id = data.get("device_id")
+        if not device_id:
+            device_id = (
+                "NEWDEV_API"
+                if data.get("location_changed")
+                else "DEV2000"
+            )
+
+        merchant = data.get("merchant") or "OnlineStore"
+        transaction_type = data.get("transaction_type") or "UPI"
+
+        # If the user selected unusual time, use a synthetic night timestamp.
+        if data.get("unusual_time"):
+            now = now.replace(hour=2, minute=15, second=0)
+
+        transaction = {
+            "transaction_id": data.get("transaction_id") or f"API{datetime.now().strftime('%Y%m%d%H%M%S%f')}",
+            "account_id": account_id,
+            "receiver_id": data.get("receiver_id") or "API_RECEIVER",
+            "amount": float(data["amount"]),
+            "timestamp": now,
+            "location": location,
+            "device_id": device_id,
+            "merchant": merchant,
+            "transaction_type": transaction_type,
+        }
+
+        # Create recent synthetic activity when the user selects
+        # "multiple transactions", so the sliding-window rule is meaningful.
+        if data.get("multiple_transactions"):
+            for i in range(3):
+                history_tx = transaction.copy()
+                history_tx["transaction_id"] = f"{transaction['transaction_id']}_H{i}"
+                history_tx["amount"] = max(100.0, transaction["amount"] * 0.8)
+                history_tx["timestamp"] = now - timedelta(minutes=i + 1)
+                # Add synthetic recent activity only to the sliding window.
+                # Do not add it to behavior history, otherwise the current
+                # device/location could incorrectly look familiar.
+                self.recent_transactions.add(history_tx)
+
+        return self.process_transaction(transaction)
